@@ -11,17 +11,6 @@ type
     month*: int
     day*:   int
 
-  Conn* = object
-    config*: Config
-    mapi*:   MapiConn
-
-  Config* = ref object
-    username*: string
-    password*: string
-    hostname*: string
-    database*: string
-    port*:     int
-
   MapiConn* = ref object ## \
     ## MapiConn is a MonetDB's MAPI connection handle.
     ##
@@ -68,7 +57,7 @@ type
     nullOk:       int
 
   Stmt* = ref object
-    conn: Conn
+    conn: MapiConn
     query: string
     execId: int
     lastRowId:   int
@@ -321,36 +310,24 @@ proc login(c: MapiConn; attempts=0) =
     dbError("Unknown state: " & prompt)
   c.state = MAPI_STATE_READY
 
-
-proc newConn*(c: Config): Conn =
-  result = Conn(
-    config: c,
-    mapi: newMapi(c.hostname, c.port, c.username,
-                  c.password, c.database, "sql")
-  )
-  result.mapi.connect()
-
-proc newStmt*(c: Conn, q: string): Stmt = Stmt(
+proc newStmt*(c: MapiConn, q: string): Stmt = Stmt(
     conn:   c,
     query:  q,
-    execId: -1
+    execId: -1,
+    rows: @[]
   )
 
 proc close*(s: Stmt) =
-  s.conn.config = nil
-  s.conn.mapi = nil
+  s.conn = nil
 
-proc prepare(c: Conn; query: string): Stmt = newStmt(c, query)
+proc prepare(c: MapiConn; query: string): Stmt = newStmt(c, query)
 
-proc close*(c: var Conn) =
-  c.mapi.disconnect()
-  c.mapi = nil
+proc close*(c: MapiConn) =
+  c.disconnect()
 
-proc cmd*(c: Conn, command: string): string = c.mapi.cmd(command)
+proc execute*(c: MapiConn; q: string): string = c.cmd("s" & q & ";")
 
-proc execute*(c: Conn; q: string): string = c.cmd("s" & q & ";")
-
-proc begin*(c: Conn) =
+proc begin*(c: MapiConn) =
   discard c.execute("START TRANSACTION")
 
 const
@@ -564,8 +541,10 @@ proc parseTuple(s: Stmt, d: string): seq[Value] =
 proc updateDescription(s: Stmt, columnNames, columnTypes: openarray[string],
                        displaySizes, internalSizes,
                        precisions, scales, nullOks: openarray[int]) =
-
-  setLen(s.description, len(columnNames))
+  if s.description.isNil:
+    newSeq(s.description, len(columnNames))
+  else:
+    setLen(s.description, len(columnNames))
   for i in 0..high(columnNames):
     s.description[i] = Description(
       columnName:   columnNames[i],
@@ -659,8 +638,8 @@ proc storeResult(s: Stmt; r: string) =
       discard "nothing to do"
     elif line.startsWith mapi_MSG_ERROR:
       dbError("Database error: " & line.substr(1))
-
-  dbError("Unknown state: " & r)
+    else:
+      dbError("Unknown state: " & r)
 
 const
   c_ARRAY_SIZE = 100
@@ -705,16 +684,18 @@ proc prepareQuery(s: Stmt) =
 proc execAsStr*(s: Stmt; args: openarray[Value]): string =
   if s.execId == -1:
     s.prepareQuery()
+  if s.execId > 0:
+    var b = "EXEC " & $s.execId & " ("
+    var i = 0
+    for v in args:
+      if i > 0: b.add(", ")
+      toQuotedString(v, b)
+      inc i
 
-  var b = "EXEC " & $s.execId & " ("
-  var i = 0
-  for v in args:
-    if i > 0: b.add(", ")
-    toQuotedString(v, b)
-    inc i
-
-  b.add(')')
-  result = s.conn.execute(b)
+    b.add(')')
+    result = s.conn.execute(b)
+  else:
+    result = s.conn.execute(s.query)
 
 proc exec*(s: Stmt; args: openArray[Value]): DbResult =
   result = DbResult()
@@ -734,8 +715,11 @@ proc query*(s: Stmt; args: openarray[Value]): Rows =
   result.rows = s.rows
   result.description = s.description
 
-proc commit*(c: Conn) =
+proc query*(c: MapiConn; q: string; args: varargs[Value]): string =
+  query(newStmt(c, q), args).rows[0][0]
+
+proc commit*(c: MapiConn) =
   discard c.execute("COMMIT")
 
-proc rollback*(c: Conn) =
+proc rollback*(c: MapiConn) =
   discard c.execute("ROLLBACK")

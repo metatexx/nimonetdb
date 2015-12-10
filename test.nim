@@ -5,7 +5,7 @@ proc main =
   echo "main"
   let db = newMapi("localhost", 50_000, "voc", "voc", "voc", "sql")
   db.connect()
-  echo db.cmd("select count(*) from voyages;")
+  echo db.query("select count(*) from voyages;")
   db.disconnect()
 
 import sha1, nimSHA2

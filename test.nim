@@ -1,24 +1,28 @@
 
-import monetdb
+import db_monet, strutils
 
 proc main =
-  echo "main"
-  let db = newMapi("localhost", 50_000, "voc", "voc", "voc", "sql")
-  db.connect()
-  echo db.query("select count(*) from voyages;")
-  db.disconnect()
+  var db = open("localhost", "voc", "voc", "voc")
 
-import sha1, nimSHA2
+  when false:
+    exec(db, sql"""
 
-proc main2 =
-  const pw = "a"
-  var sha = initSHA[SHA256]()
-  sha.update(pw)
-  let p = sha.final().toHex()
-  echo "sha256 ", pw, " ", p
-  echo "sha1 ", sha1.compute(pw).toHex()
+  CREATE TABLE "voc"."test" (
+      "id"   INTEGER,
+      "data" VARCHAR(30)
+  );""", [])
+  exec(db, sql"insert into test values(?,?)", ["34", "value üäß with \\ \' \" funny \t"])
+  #exec(db, sql"insert into tbl1 values(?, ?)", ["testB", "55"])
+  #db.query("create table tbl1(one varchar(10), two smallint)")
+  #db.query("insert into tbl1 values('hello!',10)")
+  #db.query("insert into tbl1 values('goodbye', 20)")
+  echo db.getValue(sql"select count(*) from voyages")
+  var i = 0
+  for r in db.rows(sql"select * from test limit 10", []):
+    echo(r)
+    inc i
+    if i == 8: break
 
-  let pwhash = "{SHA1}" & sha1.compute(p & "salt").toHex()
-  echo pwhash
+  close(db)
 
 main()

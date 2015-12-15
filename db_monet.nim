@@ -7,44 +7,42 @@
 #    distribution, for details about the copyright.
 #
 
-import times, net, nimSHA2, sha1, md5, strutils
+import times, net, nimSHA2, sha1, md5, strutils, parseutils
 
 type
   DbError* = object of IOError ## exception that is raised if a database error occurs
 
-  Time* = object ## Time represents MonetDB's Time datatype.
-    hour*, min*, sec*: int
-  Date* = object ## Time represents MonetDB's Date datatype.
-    year*:  int
-    month*: int
-    day*:   int
+  DbEffect* = object of IOEffect ## effect that denotes a database operation
+  ReadDbEffect* = object of DbEffect   ## effect that denotes a read operation
+  WriteDbEffect* = object of DbEffect  ## effect that denotes a write operation
 
-  MapiConn* = ref object ## \
-    ## MapiConn is a MonetDB's MAPI connection handle.
-    ##
-    ## The values in the handle are initially set according to the values
-    ## that are provided when calling newMapi(). However, they may change
-    ## depending on how the MonetDB server redirects the connection.
-    ## The final values are available after the connection is made by
-    ## calling the connect() proc.
-    ##
-    ## The State value can be either MAPI_STATE_INIT or MAPI_STATE_READY.
-    hostname*: string
-    port*:     int
-    username*: string
-    password*: string
-    database*: string
-    language*: string
-    state*: int
-    conn*: Socket
+  SqlQuery* = distinct string ## an SQL query string
 
-  DbResult* = object
+  DbConnState = enum
+    MAPI_STATE_INIT, # MAPI connection is NOT established.
+    MAPI_STATE_READY # MAPI connection is established.
+
+  DbConn* = ref object ## \
+    ## DbConn is a MonetDB's MAPI connection handle.
+    hostname: string
+    port:     int
+    username: string
+    password: string
+    database: string
+    language: string
+    state: DbConnState
+    conn: Socket
+
+  DbResult = object
     lastInsertId: int
     rowsAffected: int
 
   Value* = string
+
+  Row* = seq[string]  ## a row of a dataset. NULL database values will be
+                      ## transformed always to nil strings.
+
   Rows* = object
-    stmt:   Stmt
     active: bool
     queryId: int
     rowNum:      int
@@ -64,9 +62,7 @@ type
     scale:        int
     nullOk:       int
 
-  Stmt* = ref object
-    conn: MapiConn
-    query: string
+  Stmt = object
     execId: int
     lastRowId:   int
     rowCount:    int
@@ -95,10 +91,6 @@ const
   mapi_MSG_OK       = "=OK"
   mapi_MSG_MORE = "\1\2\10"
 
-const
-  MAPI_STATE_READY = 1 # MAPI connection is established.
-  MAPI_STATE_INIT = 0 # MAPI connection is NOT established.
-
 proc dbError*(msg: string) {.noreturn, noinline.} =
   ## raises an DbError exception with message `msg`.
   var e: ref DbError
@@ -106,55 +98,21 @@ proc dbError*(msg: string) {.noreturn, noinline.} =
   e.msg = msg
   raise e
 
-proc `$`*(t: Time): string =
-  ## string representation of a Time
-  ## in the form "HH:MM:SS".
-  intToStr(t.hour, 2) & ":" & intToStr(t.min, 2) & ":" & intToStr(t.sec, 2)
+template sql*(query: string): SqlQuery =
+  ## constructs a SqlQuery from the string `query`. This is supposed to be
+  ## used as a raw-string-literal modifier:
+  ## ``sql"update user set counter = counter + 1"``
+  ##
+  ## If assertions are turned off, it does nothing. If assertions are turned
+  ## on, later versions will check the string for valid syntax.
+  SqlQuery(query)
 
-proc toStdTime(t: Time): times.Time =
-  # Converts to times.Time. The date is set to January 1, 1970.
-  let ti = TimeInfo(
-    second: t.sec,
-    minute: t.min,
-    hour: t.hour,
-    monthday: 1,
-    month: mJan,
-    year: 1970,
-    tzname: "UTC")
-  result = timeInfoToTime(ti)
-
-proc `$`*(d: Date): string =
-  ## String representation of a Date in the form "YYYY-MM-DD".
-  intToStr(d.year, 4) & "-" & intToStr(d.month, 2) & "-" & intToStr(d.day, 2)
-
-proc toStdTime(d: Date): times.Time =
-  ## Converts to time.Time. The time is set to 00:00:00.
-  let ti = TimeInfo(
-    second: 0,
-    minute: 0,
-    hour: 0,
-    monthday: d.day,
-    month: Month(d.month-1),
-    year: d.year,
-    tzname: "UTC")
-  result = timeInfoToTime(ti)
-
-proc getTime*(t: times.Time): monetdb.Time =
-  ## Takes the clock part of a times.Time and puts it in a Time.
-  let ti = getGMTime(t)
-  Time(hour: ti.hour, min: ti.minute, sec: ti.second)
-
-proc getDate*(t: times.Time): Date =
-  ## Takes the date part of a time.Time and puts it in a Date.
-  let ti = getGMTime(t)
-  Date(year: ti.year, month: ti.month.int+1, day: ti.monthday)
-
-proc newMapi*(hostname: string; port: int;
-              username, password, database, language: string): MapiConn =
+proc newMapi(hostname: string; port: int;
+             username, password, database, language: string): DbConn =
   ## NewMapi returns a MonetDB's MAPI connection handle.
   ##
   ## To establish the connection, call the Connect() proc.
-  MapiConn(
+  DbConn(
     hostname: hostname,
     port:     port,
     username: username,
@@ -164,15 +122,14 @@ proc newMapi*(hostname: string; port: int;
     state: MAPI_STATE_INIT
   )
 
-
-proc getBytes(c: MapiConn; count: int): string =
+proc getBytes(c: DbConn; count: int): string =
   # getBytes reads the given amount of bytes.
   result = newStringOfCap(count)
   let x = c.conn.recv(result, count)
   if x != count:
     dbError("received " & $x & " bytes, but expected " & $count)
 
-proc getBlock(c: MapiConn): string =
+proc getBlock(c: DbConn): string =
   # getBlock retrieves a block of message.
   result = ""
   var last = 0
@@ -188,13 +145,13 @@ proc getBlock(c: MapiConn): string =
     let d = c.getBytes(length)
     result.add(d)
 
-proc putBlock(c: MapiConn; b: string) =
+proc putBlock(c: DbConn; b: string) =
   # putBlock sends the given data as one or more blocks.
   var pos = 0
   var last = 0
   while last != 1:
     let xend = min(pos + mapi_MAX_PACKAGE_LENGTH, b.len)
-    let length = xend-pos+1
+    let length = xend-pos
     if length < mapi_MAX_PACKAGE_LENGTH:
       last = 1
     var packed = uint16((length shl 1) + last)
@@ -205,14 +162,14 @@ proc putBlock(c: MapiConn; b: string) =
     pos += length
 
 # Disconnect closes the connection.
-proc disconnect*(c: MapiConn) =
+proc disconnect(c: DbConn) =
   c.state = MAPI_STATE_INIT
   if c.conn != nil:
     c.conn.close()
     c.conn = nil
 
 # Cmd sends a MAPI command to MonetDB.
-proc cmd*(c: MapiConn; operation: string): string =
+proc cmd(c: DbConn; operation: string): string =
   if c.state != MAPI_STATE_READY:
     dbError("Database not connected")
 
@@ -234,7 +191,7 @@ proc cmd*(c: MapiConn; operation: string): string =
   else:
     dbError("Unknown state: " & resp)
 
-proc challengeResponse(c: MapiConn; challenge: string): string =
+proc challengeResponse(c: DbConn; challenge: string): string =
   let t = split(challenge, ":")
   let
     salt = t[0]
@@ -263,9 +220,9 @@ proc challengeResponse(c: MapiConn; challenge: string): string =
     dbError("Unsupported hash algorithm required for login " & hashes)
   result = "BIG:$#:$#:$#:$#:" % [c.username, pwhash, c.language, c.database]
 
-proc login(c: MapiConn; attempts=0) {.gcsafe, locks: 0.}
+proc login(c: DbConn; attempts=0) {.gcsafe, locks: 0.}
 
-proc connect*(c: MapiConn) =
+proc connect(c: DbConn) =
   ## Connect starts a MAPI connection to MonetDB server.
   if c.conn != nil:
     c.conn.close()
@@ -277,7 +234,7 @@ proc connect*(c: MapiConn) =
   c.conn = sock
   c.login()
 
-proc login(c: MapiConn; attempts=0) =
+proc login(c: DbConn; attempts=0) =
   let challenge = c.getBlock()
 
   let response = c.challengeResponse(challenge)
@@ -318,25 +275,9 @@ proc login(c: MapiConn; attempts=0) =
     dbError("Unknown state: " & prompt)
   c.state = MAPI_STATE_READY
 
-proc newStmt*(c: MapiConn, q: string): Stmt = Stmt(
-    conn:   c,
-    query:  q,
-    execId: -1,
-    rows: @[]
-  )
+proc close(s: Stmt) = discard
 
-proc close*(s: Stmt) =
-  s.conn = nil
-
-proc prepare(c: MapiConn; query: string): Stmt = newStmt(c, query)
-
-proc close*(c: MapiConn) =
-  c.disconnect()
-
-proc execute*(c: MapiConn; q: string): string = c.cmd("s" & q & ";")
-
-proc begin*(c: MapiConn) =
-  discard c.execute("START TRANSACTION")
+proc rawExecute(c: DbConn; q: string): string = c.cmd("s" & q & ";")
 
 const
   mdb_CHAR      = "char"    # (L) character string with length L
@@ -376,158 +317,7 @@ const
   mdb_NUMERIC                 = mdb_DECIMAL
   mdb_DOUBLE_PRECISION        = mdb_DOUBLE
 
-# adapted from strconv.Unquote
-proc unquote(s: string): string =
-  result = s # XXX Test this really well
-  when false:
-    # Is it trivial?  Avoid allocation.
-    if not contains(s, '\\'):
-      return s
-
-    var runeTmp: array[8, char]
-    result = newStringOfCap(3*len(s) div 2)
-    while len(s) > 0:
-      let (c, multibyte, ss, err) = strconv.UnquoteChar(s, '\'')
-      s = ss
-      if c < utf8.RuneSelf or not multibyte:
-        result.add byte(c)
-      else:
-        let n = utf8.EncodeRune(runeTmp[0..^1], c)
-        #buf = append(buf, runeTmp[:n]...)
-        result.add runeTmp
-
-template mystrip(v: string): Value = v
-  #result = unquote(strutils.strip(v[1 : len(v)-1]))
-
-proc toByteArray(v: string): Value = v
-  #return []byte(v[1 : len(v)-1]), nil
-
-proc toDouble(v: string): Value = v
-
-proc toFloat(v: string): Value = v
-
-proc toInt8(v: string): Value = v
-proc toInt16(v: string): Value = v
-proc toInt32(v: string): Value = v
-proc toInt64(v: string): Value = v
-
-proc parseTime(v: string): times.Time =
-  const timeFormats = [
-    "2006-01-02",
-    "2006-01-02 15:04:05",
-    "2006-01-02 15:04:05 -0700",
-    "2006-01-02 15:04:05 -0700 MST",
-    "Mon Jan 2 15:04:05 -0700 MST 2006",
-    "15:04:05"
-  ]
-  for f in timeFormats:
-    try:
-      return timeInfoToTime(times.parse(f, v))
-    except ValueError:
-      discard
-
-proc toBool(v: string): Value =
-  result = v
-  when false:
-    return strconv.parseBool(v)
-
-proc toDate(v: string): Value =
-  result = v
-  when false:
-    t = parseTime(v)
-    let (year, month, day) = t.Date()
-    return Date{year, month, day}
-
-proc toTime(v: string): Value =
-  result = v
-  when false:
-    t = parseTime(v)
-    let (hour, min, sec) = t.clock()
-    return Time{hour, min, sec}
-
-proc toQuotedString(s: Value; result: var string) =
-  #result = newStringOfCap(s.len + 4)
-  result.add('\'')
-  for c in items(s):
-    case c
-    of '\\': add(result, "\\\\")
-    of '\'': add(result, "\\'")
-    else: add(result, c)
-  add(result, '\'')
-
-when false:
-  proc toTimestamp(v: string): Value =
-    return parseTime(v)
-
-  proc toTimestampTz(v: string): Value =
-    return parseTime(v)
-
-  proc toString(v: Value): string = v
-    #return fmt.Sprintf("%v", v), nil
-
-  proc toByteString(v: Value): string = toQuotedString(v)
-
-  proc toDateTimeString(v: Time): string = toQuotedString($v)
-  proc toDateTimeString(v: Date): string = toQuotedString($v)
-
-proc convertToNim(value, dataType: string): Value =
-  let v = strutils.strip(value)
-
-  case datatype
-  of mdb_CHAR:           result = mystrip v
-  of mdb_VARCHAR:        result = mystrip v
-  of mdb_CLOB:           result = mystrip v
-  of mdb_BLOB:           result = toByteArray v
-  of mdb_DECIMAL:        result = toDouble v
-  of mdb_SMALLINT:       result = toInt16 v
-  of mdb_INT:            result = toInt32 v
-  of mdb_WRD:            result = toInt32 v
-  of mdb_BIGINT:         result = toInt64 v
-  of mdb_SERIAL:         result = toInt64 v
-  of mdb_REAL:           result = toFloat v
-  of mdb_DOUBLE:         result = toDouble v
-  of mdb_BOOLEAN:        result = toBool v
-  of mdb_DATE:           result = toDate v
-  of mdb_TIME:           result = toTime v
-  of mdb_TIMESTAMP:      result = v #toTimestamp v
-  of mdb_TIMESTAMPTZ:    result = v #toTimestampTz v
-  of mdb_INTERVAL:       result = mystrip v
-  of mdb_MONTH_INTERVAL: result = mystrip v
-  of mdb_SEC_INTERVAL:   result = mystrip v
-  of mdb_TINYINT:        result = toInt8 v
-  of mdb_SHORTINT:       result = toInt16 v
-  of mdb_MEDIUMINT:      result = toInt32 v
-  of mdb_LONGINT:        result = toInt64 v
-  of mdb_FLOAT:          result = toFloat v
-  else:
-    dbError("Type not supported: " & dataType)
-
-when false:
-  proc toMonet(value: int): string = $value
-  proc toMonet(value: int8): string = $value
-  proc toMonet(value: int16): string = $value
-  proc toMonet(value: int32): string = $value
-  proc toMonet(value: int64): string = $value
-
-  proc toMonet(value: float64): string = $value
-  proc toMonet(value: float32): string = $value
-  proc toMonet(value: bool): string = $value
-  proc toMonet(value: string; rawBytes: bool): string =
-    if value.isNil: "NULL"
-    elif rawBytes: toByteString value
-    else: toQuotedString value
-
-  proc toMonet(v: Time): string = $v
-  proc toMonet(v: Date): string = $v
-
-proc newRows(s: Stmt): Rows =
-  Rows(
-    stmt:   s,
-    active: true,
-    columns: nil,
-    rowNum:  0)
-
-proc columns*(r: var Rows): seq[string] =
+proc columns(r: var Rows): seq[string] =
   if r.columns == nil:
     newSeq(r.columns, len(r.description))
     for i, d in pairs(r.description):
@@ -538,15 +328,16 @@ proc close(r: var Rows) =
   r.active = false
 
 proc parseTuple(s: Stmt, d: string): seq[Value] =
-  let x = split(d.substr(1, d.len-2), ",\t")
-  if len(x) != len(s.description):
-    dbError("Length of row doesn't match header")
+  let L = len(s.description)
+  newSeq(result, L)
+  var i = 0
+  for value in split(d.substr(1, d.len-2), ",\t"):
+    if i > L:
+      dbError("Length of row doesn't match header")
+    result[i] = value
+    inc i
 
-  newSeq(result, len(x))
-  for i, value in pairs(x):
-    result[i] = convertToNim(value, s.description[i].columnType)
-
-proc updateDescription(s: Stmt, columnNames, columnTypes: openarray[string],
+proc updateDescription(s: var Stmt, columnNames, columnTypes: openarray[string],
                        displaySizes, internalSizes,
                        precisions, scales, nullOks: openarray[int]) =
   if s.description.isNil:
@@ -563,7 +354,80 @@ proc updateDescription(s: Stmt, columnNames, columnTypes: openarray[string],
       scale:        scales[i],
       nullOk:       nullOks[i])
 
-proc storeResult(s: Stmt; r: string) =
+proc parseValue(r: string; a, b: int): string =
+  if r[a] == '"':
+    result = newStringOfCap(b-a-1)
+    var i = a+1
+    while i < b:
+      case r[i]
+      of '\\':
+        case r[i+1]:
+        of 'x':
+          inc i
+          var c: int
+          i += parseutils.parseHex(r, c, i)
+          result.add(chr(c))
+          inc(i, 2)
+        of '\\':
+          result.add('\\')
+        of '\'':
+          result.add('\'')
+        of '\"':
+          result.add('\"')
+        of 't':
+          result.add('\t')
+        of 'n':
+          result.add('\L')
+        else: dbError("unkown escape sequence: \\" & r[i+1])
+        inc(i)
+      else:
+        result.add(r[i])
+      inc i
+  else:
+    result = r.substr(a, b)
+    if result == "NULL": result = nil
+
+proc parseSingleRow(r: string; start: int; row: var Row): int =
+  var i = start
+  while i < r.len-1 and not (r[i] == '\L' and r[i+1] == '['): inc i
+  inc i, 2
+  var k = i
+  while i < r.len:
+    if r[i] == ',' and r[i+1] == '\t':
+      row.add r.parseValue(k, i-1)
+      k = i+2
+      inc i, 2
+    elif r[i] == ']':
+      row.add r.parseValue(k, i-2)
+      inc i
+      break
+    else:
+      inc i
+  result = i
+
+proc `$`*(r: Row): string =
+  var L = (r.len-1) * 2
+  for i in 0..r.high: L += (if r[i].isNil: 3 else: r[i].xlen)
+  result = newStringOfCap(L)
+  for i in 0..r.high:
+    if i > 0: result.add ", "
+    if r[i].isNil: result.add "nil"
+    else: result.add r[i]
+
+proc parseUpdateResult(r: string; start: int;
+                       rowCount, lastRowId: var BiggestInt): int =
+  var i = start
+  while i < r.len and not
+    (r[i] == '\L' and r[i+1] == '&' and r[i+2] == '2'): inc i
+  inc i, 3
+  if i < r.len:
+    let L = parseBiggestInt(r, rowCount, i)
+    if L > 0:
+      inc i, L
+      i += parseBiggestInt(r, lastRowId, i)
+  result = i
+
+proc storeResult(s: var Stmt; r: string) =
   var columnNames: seq[string]
   var columnTypes: seq[string]
   var displaySizes: seq[int]
@@ -652,7 +516,7 @@ proc storeResult(s: Stmt; r: string) =
 const
   c_ARRAY_SIZE = 100
 
-proc fetchNext*(r: var Rows) =
+proc fetchNext(db: DbConn; r: var Rows) =
   if r.rowNum >= r.rowCount:
     return
 
@@ -661,13 +525,13 @@ proc fetchNext*(r: var Rows) =
   let amount = xend - r.offset
 
   let cmd0 = "Xexport $# $# $#" % [$r.queryId, $r.offset, $amount]
-  let res = r.stmt.conn.cmd(cmd0)
+  let res = db.cmd(cmd0)
 
-  r.stmt.storeResult(res)
-  r.rows = r.stmt.rows
-  r.description = r.stmt.description
+  #r.storeResult(res) XXX
+  #r.rows = r.stmt.rows
+  #r.description = r.stmt.description
 
-proc next*(r: var Rows; dest: var seq[Value]) =
+proc next(db: DbConn; r: var Rows; dest: var seq[Value]) =
   if not r.active:
     dbError("Rows closed")
   if r.queryId == -1:
@@ -676,58 +540,162 @@ proc next*(r: var Rows; dest: var seq[Value]) =
     # EOF:
     return
   if r.rowNum >= r.offset+len(r.rows):
-    r.fetchNext()
+    db.fetchNext(r)
 
   for i, v in mpairs(r.rows[r.rowNum-r.offset]):
-    #if vv, ok := v.(string); ok:
-    #  dest[i] = []byte(vv)
-    #else:
     dest[i] = v
   r.rowNum += 1
 
-proc prepareQuery(s: Stmt) =
-  let r = s.conn.execute("PREPARE " & s.query)
-  s.storeResult(r)
-
-proc execAsStr*(s: Stmt; args: openarray[Value]): string =
-  if s.execId == -1:
-    s.prepareQuery()
-  if s.execId > 0:
-    var b = "EXEC " & $s.execId & " ("
-    var i = 0
-    for v in args:
-      if i > 0: b.add(", ")
-      toQuotedString(v, b)
-      inc i
-
-    b.add(')')
-    result = s.conn.execute(b)
+proc dbQuote(s: string; result: var string) =
+  if s.isNil:
+    result.add "NULL"
   else:
-    result = s.conn.execute(s.query)
+    add(result, '\'')
+    for c in items(s):
+      case c
+      of '\\': add(result, "\\\\")
+      of '\'': add(result, "\\'")
+      else: add(result, c)
+    add(result, '\'')
 
-proc exec*(s: Stmt; args: openArray[Value]): DbResult =
-  result = DbResult()
-  let r = s.execAsStr(args)
-  s.storeResult(r)
-  result.lastInsertId = s.lastRowId
-  result.rowsAffected = s.rowCount
+proc dbFormat(formatstr: SqlQuery, args: varargs[string]): string =
+  # XXX implement query caching!
+  result = ""
+  var a = 0
+  for c in items(string(formatstr)):
+    if c == '?':
+      dbQuote(args[a], result)
+      inc(a)
+    else:
+      add(result, c)
 
-proc query*(s: Stmt; args: openarray[Value]): Rows =
-  result = newRows(s)
-  let r = s.execAsStr(args)
-  s.storeResult(r)
-  result.queryId = s.queryId
-  result.lastRowId = s.lastRowId
-  result.rowCount = s.rowCount
-  result.offset = s.offset
-  result.rows = s.rows
-  result.description = s.description
+proc exec*(db: DbConn, query: SqlQuery, args: varargs[string, `$`]) =
+  ## executes the query and raises DbError if not successful.
+  let q = dbFormat(query, args)
+  let rawResult = db.rawExecute(q)
+  echo q #rawResult
+  if rawResult[0] == '!':
+    dbError("Database error: " & rawResult.substr(1))
+  else:
+    let x = rawResult.find("\L!")
+    if x >= 0:
+      dbError("Database error: " & rawResult.substr(x+2))
 
-proc query*(c: MapiConn; q: string; args: varargs[Value]): string =
-  query(newStmt(c, q), args).rows[0][0]
+proc tryExec*(db: DbConn, query: SqlQuery,
+              args: varargs[string, `$`]): bool =
+  ## tries to execute the query and returns true if successful, false otherwise.
+  try:
+    db.exec(query, args)
+    result = true
+  except DbError:
+    result = false
 
-proc commit*(c: MapiConn) =
-  discard c.execute("COMMIT")
+iterator fastRows*(db: DbConn, query: SqlQuery,
+                   args: varargs[string, `$`]): Row =
+  ## Executes the query and iterates over the result dataset.
+  ##
+  ## This is very fast, but potentially dangerous.  Use this iterator only
+  ## if you require **ALL** the rows.
+  ##
+  ## Breaking the fastRows() iterator during a loop will cause the next
+  ## database query to raise an [EDb] exception ``unable to close due to ...``.
+  let q = dbFormat(query, args)
 
-proc rollback*(c: MapiConn) =
-  discard c.execute("ROLLBACK")
+  let rawResult = db.rawExecute(q)
+  var i = 0
+  var result: Row = @[]
+  while true:
+    result.setLen 0
+    i = parseSingleRow(rawResult, i, result)
+    if i >= rawResult.len: break
+    yield result
+
+proc getRow*(db: DbConn, query: SqlQuery,
+             args: varargs[string, `$`]): Row =
+  ## retrieves a single row. If the query doesn't return any rows, this proc
+  ## will return a Row with empty strings for each column.
+  let q = dbFormat(query, args)
+  let rawResult = db.rawExecute(q)
+  var i = 0
+  result = @[]
+  discard parseSingleRow(rawResult, i, result)
+
+proc getAllRows*(db: DbConn, query: SqlQuery,
+                 args: varargs[string, `$`]): seq[Row] =
+  ## executes the query and returns the whole result dataset.
+  result = @[]
+  for r in fastRows(db, query, args):
+    result.add(r)
+
+iterator rows*(db: DbConn, query: SqlQuery,
+               args: varargs[string, `$`]): Row =
+  ## same as `FastRows`, but slower and safe.
+  for r in fastRows(db, query, args): yield r
+
+proc getValue*(db: DbConn, query: SqlQuery,
+               args: varargs[string, `$`]): string =
+  ## executes the query and returns the first column of the first row of the
+  ## result dataset. Returns nil if the dataset contains no rows or the database
+  ## value is NULL.
+  let q = dbFormat(query, args)
+  let r = db.rawExecute(q)
+  var i = 0
+  while i < r.len and not (r[i] == '\L' and r[i+1] == '['): inc i
+  inc i, 2
+  var k = i
+  while i < r.len:
+    if r[i] == ',' and r[i+1] == '\t' or r[i] == ']':
+      return r.substr(k, i-1)
+    inc i
+
+proc tryInsertID*(db: DbConn, query: SqlQuery,
+                  args: varargs[string, `$`]): int64 =
+  ## executes the query (typically "INSERT") and returns the
+  ## generated ID for the row or -1 in case of an error.
+  let q = dbFormat(query, args)
+  let rawResult = db.rawExecute(q)
+  result = -1
+  var rowCount: BiggestInt
+  discard rawResult.parseUpdateResult(0, rowCount, result)
+
+proc insertID*(db: DbConn, query: SqlQuery,
+               args: varargs[string, `$`]): int64 =
+  ## executes the query (typically "INSERT") and returns the
+  ## generated ID for the row. For Postgre this adds
+  ## ``RETURNING id`` to the query, so it only works if your primary key is
+  ## named ``id``.
+  result = tryInsertID(db, query, args)
+  if result < 0: dbError("query failed: " & query.string)
+
+proc execAffectedRows*(db: DbConn, query: SqlQuery,
+                       args: varargs[string, `$`]): int64 =
+  ## executes the query (typically "UPDATE") and returns the
+  ## number of affected rows.
+  let q = dbFormat(query, args)
+  let rawResult = db.rawExecute(q)
+  result = -1
+  var lastId: BiggestInt
+  discard rawResult.parseUpdateResult(0, result, lastId)
+
+proc close*(db: DbConn) {.tags: [DbEffect].} =
+  ## closes the database connection.
+  db.disconnect()
+
+proc open*(connection, user, password, database: string): DbConn =
+  let x = connection.find(':')
+  if x >= 0:
+    result = newMapi(hostname = connection.substr(0, x-1),
+                     port = parseInt(connection.substr(x+1)),
+                     username = user,
+                     password = password,
+                     database = database,
+                     language = "sql")
+  else:
+    result = newMapi(hostname = connection,
+                     port = 50_000,
+                     username = user,
+                     password = password,
+                     database = database,
+                     language = "sql")
+  result.connect()
+

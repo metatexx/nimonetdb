@@ -8,16 +8,10 @@
 #
 
 import times, net, nimSHA2, sha1, md5, strutils, parseutils
+import db_common
+export db_common
 
 type
-  DbError* = object of IOError ## exception that is raised if a database error occurs
-
-  DbEffect* = object of IOEffect ## effect that denotes a database operation
-  ReadDbEffect* = object of DbEffect   ## effect that denotes a read operation
-  WriteDbEffect* = object of DbEffect  ## effect that denotes a write operation
-
-  SqlQuery* = distinct string ## an SQL query string
-
   DbConnState = enum
     MAPI_STATE_INIT, # MAPI connection is NOT established.
     MAPI_STATE_READY # MAPI connection is established.
@@ -41,6 +35,9 @@ type
 
   Row* = seq[string]  ## a row of a dataset. NULL database values will be
                       ## transformed always to nil strings.
+
+  InstantRow* = Row   ## For now an alias to ``Row``. Provided so
+                      ## that db_monet adheres to Nim db* interface.
 
   Rows* = object
     active: bool
@@ -91,25 +88,9 @@ const
   mapi_MSG_OK       = "=OK"
   mapi_MSG_MORE = "\1\2\10"
 
-proc dbError*(msg: string) {.noreturn, noinline.} =
-  ## raises an DbError exception with message `msg`.
-  var e: ref DbError
-  new(e)
-  e.msg = msg
-  raise e
-
-template sql*(query: string): SqlQuery =
-  ## constructs a SqlQuery from the string `query`. This is supposed to be
-  ## used as a raw-string-literal modifier:
-  ## ``sql"update user set counter = counter + 1"``
-  ##
-  ## If assertions are turned off, it does nothing. If assertions are turned
-  ## on, later versions will check the string for valid syntax.
-  SqlQuery(query)
-
 proc newMapi(hostname: string; port: int;
              username, password, database, language: string): DbConn =
-  ## NewMapi returns a MonetDB's MAPI connection handle.
+  ## Returns a MonetDB's MAPI connection handle.
   ##
   ## To establish the connection, call the Connect() proc.
   DbConn(
@@ -525,7 +506,7 @@ proc fetchNext(db: DbConn; r: var Rows) =
   let amount = xend - r.offset
 
   let cmd0 = "Xexport $# $# $#" % [$r.queryId, $r.offset, $amount]
-  let res = db.cmd(cmd0)
+  discard db.cmd(cmd0)
 
   #r.storeResult(res) XXX
   #r.rows = r.stmt.rows
@@ -558,6 +539,11 @@ proc dbQuote(s: string; result: var string) =
       else: add(result, c)
     add(result, '\'')
 
+proc dbQuote*(s: string): string =
+  ## DB quotes the string.
+  result = newStringOfCap(s.len)
+  dbQuote(s, result)
+
 proc dbFormat(formatstr: SqlQuery, args: varargs[string]): string =
   # XXX implement query caching!
   result = ""
@@ -573,7 +559,7 @@ proc exec*(db: DbConn, query: SqlQuery, args: varargs[string, `$`]) =
   ## executes the query and raises DbError if not successful.
   let q = dbFormat(query, args)
   let rawResult = db.rawExecute(q)
-  echo q #rawResult
+  #echo q #rawResult
   if rawResult[0] == '!':
     dbError("Database error: " & rawResult.substr(1))
   else:
@@ -631,6 +617,133 @@ iterator rows*(db: DbConn, query: SqlQuery,
                args: varargs[string, `$`]): Row =
   ## same as `FastRows`, but slower and safe.
   for r in fastRows(db, query, args): yield r
+
+iterator instantRows*(db: DbConn, query: SqlQuery,
+                      args: varargs[string, `$`]): InstantRow =
+  ## same as fastRows but returns a handle that can be used to get column text
+  ## on demand using []. Returned handle is valid only within the iterator body.
+  for r in fastRows(db, query, args): yield r
+
+proc setTypeName(t: var DbType; name: string) =
+  shallowCopy(t.name, name)
+  case name
+  of "int":
+    t.kind = dbInt
+    t.size = 4
+  of "char":
+    t.kind = dbFixedChar
+  of "varchar":
+    t.kind = dbVarchar
+  of "clob", "blob":
+    t.kind = dbBlob
+  of "decimal":
+    t.kind = dbDecimal
+  of "tinyint":
+    t.kind = dbInt
+    t.size = 1
+  of "smallint", "shortint":
+    t.kind = dbInt
+    t.size = 2
+  of "bigint":
+    t.kind = dbInt
+    t.size = 8
+  of "hugeint":
+    t.kind = dbInt
+    t.size = 16
+  of "serial":
+    t.kind = dbSerial
+    t.size = 8
+  of "real", "float":
+    t.kind = dbFloat
+    t.size = 4
+  of "double":
+    t.kind = dbFloat
+    t.size = 8
+  of "boolean":
+    t.kind = dbBool
+    t.size = 1
+  of "date":
+    t.kind = dbDate
+  of "time":
+    t.kind = dbTime
+  of "timestamp", "timestamptz":
+    t.kind = dbTimestamp
+  of "interval", "month_interval", "sec_interval":
+    t.kind = dbTimeInterval
+  else:
+    t.kind = dbUnknown
+
+proc parseColumnInfo(r: string; columns: var DbColumns) =
+  # Example input:
+  # &1 0 6 2 6
+  # % voc.test,  voc.test # table_name
+  # % id,  data # name
+  # % int,  varchar # type
+  # % 2,  30 # length
+  var i = r.find("\L%")
+  if i < 0: return
+  inc i
+  var tableNames, names, types, typesizes, lens: (int, int)
+  while r[i] == '%':
+    inc i
+    while r[i] == ' ': inc i
+    var lineEnd = i
+    while lineEnd < r.len-1 and r[lineEnd] != '\L': inc lineEnd
+    var hash = lineEnd
+    while hash > 0 and r[hash] != '#': dec(hash)
+    if hash > 0:
+      case r.substr(hash+2, lineEnd-1)
+      of "table_name": tableNames = (i, hash-2)
+      of "name": names = (i, hash-2)
+      of "type": types = (i, hash-2)
+      of "typesizes": typesizes = (i, hash-2)
+      of "length": lens = (i, hash-2)
+      else: discard
+    i = lineEnd+1
+  #echo r
+  #echo tableNames, " ", names, " ", types, " ", typesizes, " ", lens
+  var n = names[0]
+  var cols = 0
+
+  proc colEnd(r: string; b: var((int, int))): string =
+    var i = b[0]
+    if i == 0: return ""
+    while i < b[1] and r[i+1] != ',': inc i
+    result = r.substr(b[0], i)
+    #echo "##", result, "##"
+    inc i, 2 # skip comma
+    while i < b[1] and r[i] == '\t': inc i
+    b[0] = i
+
+  while names[0] < names[1]:
+    if cols >= columns.len:
+      setLen(columns, cols+1)
+    setTypeName columns[cols].typ, r.colEnd(types)
+    columns[cols].name = r.colEnd(names)
+    columns[cols].tableName = r.colEnd(tableNames)
+    let sizeAsStr = r.colEnd(lens)
+    if sizeAsStr.len > 0 and columns[cols].typ.kind != dbInt:
+      columns[cols].typ.size = parseInt(sizeAsStr)
+    let typeSizesAsStr = r.colEnd(typesizes)
+    if typeSizesAsStr.len > 0:
+      var i = parseInt(typeSizesAsStr, columns[cols].typ.precision, 0)
+      while typeSizesAsStr[i] == ' ': inc i
+      discard parseInt(typeSizesAsStr, columns[cols].typ.scale, i)
+    inc cols
+
+iterator instantRows*(db: DbConn; columns: var DbColumns; query: SqlQuery;
+                      args: varargs[string, `$`]): InstantRow =
+  ## also returns column information at the same time.
+  let q = dbFormat(query, args)
+  let rawResult = db.rawExecute(q)
+  parseColumnInfo(rawResult, columns)
+  var i = 0
+  var result: Row = @[]
+  while true:
+    result.setLen 0
+    i = parseSingleRow(rawResult, i, result)
+    if i >= rawResult.len: break
+    yield result
 
 proc getValue*(db: DbConn, query: SqlQuery,
                args: varargs[string, `$`]): string =
@@ -699,3 +812,11 @@ proc open*(connection, user, password, database: string): DbConn =
                      language = "sql")
   result.connect()
 
+
+proc setEncoding*(connection: DbConn, encoding: string): bool {.
+  tags: [DbEffect].} =
+  ## sets the encoding of a database connection, returns true for
+  ## success, false for failure.
+  ##
+  ## For Monet DB this is not supported and it always returns false.
+  return false

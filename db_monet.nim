@@ -27,10 +27,6 @@ type
     state: DbConnState
     conn: Socket
 
-  DbResult = object
-    lastInsertId: int
-    rowsAffected: int
-
   Value* = string
 
   Row* = seq[string]  ## a row of a dataset. NULL database values will be
@@ -39,49 +35,12 @@ type
   InstantRow* = Row   ## For now an alias to ``Row``. Provided so
                       ## that db_monet adheres to Nim db* interface.
 
-  Rows* = object
-    active: bool
-    queryId: int
-    rowNum:      int
-    offset:      int
-    lastRowId:   int
-    rowCount:    int
-    rows: seq[seq[Value]]
-    description: seq[Description]
-    columns: seq[string]
-
-  Description = object
-    columnName:   string
-    columnType:   string
-    displaySize:  int
-    internalSize: int
-    precision:    int
-    scale:        int
-    nullOk:       int
-
-  Stmt = object
-    execId: int
-    lastRowId:   int
-    rowCount:    int
-    queryId:     int
-    offset:      int
-    columnCount: int
-    rows:        seq[seq[Value]]
-    description: seq[Description]
-
 const
   mapi_MAX_PACKAGE_LENGTH = (1024 * 8) - 2
 
-  mapi_MSG_PROMPT   = ""
   mapi_MSG_INFO     = "#"
   mapi_MSG_ERROR    = "!"
   mapi_MSG_Q        = "&"
-  mapi_MSG_QTABLE   = "&1"
-  mapi_MSG_QUPDATE  = "&2"
-  mapi_MSG_QSCHEMA  = "&3"
-  mapi_MSG_QTRANS   = "&4"
-  mapi_MSG_QPREPARE = "&5"
-  mapi_MSG_QBLOCK   = "&6"
   mapi_MSG_HEADER   = "%"
   mapi_MSG_TUPLE    = "["
   mapi_MSG_REDIRECT = "^"
@@ -256,84 +215,7 @@ proc login(c: DbConn; attempts=0) =
     dbError("Unknown state: " & prompt)
   c.state = MAPI_STATE_READY
 
-proc close(s: Stmt) = discard
-
 proc rawExecute(c: DbConn; q: string): string = c.cmd("s" & q & ";")
-
-const
-  mdb_CHAR      = "char"    # (L) character string with length L
-  mdb_VARCHAR   = "varchar" # (L) string with atmost length L
-  mdb_CLOB      = "clob"
-  mdb_BLOB      = "blob"
-  mdb_DECIMAL   = "decimal"  # (P,S)
-  mdb_SMALLINT  = "smallint" # 16 bit integer
-  mdb_INT       = "int"      # 32 bit integer
-  mdb_BIGINT    = "bigint"   # 64 bit integer
-  mdb_SERIAL    = "serial"   # special 64 bit integer sequence generator
-  mdb_REAL      = "real"     # 32 bit floating point
-  mdb_DOUBLE    = "double"   # 64 bit floating point
-  mdb_BOOLEAN   = "boolean"
-  mdb_DATE      = "date"
-  mdb_TIME      = "time"      # (T) time of day
-  mdb_TIMESTAMP = "timestamp" # (T) date concatenated with unique time
-  mdb_INTERVAL  = "interval"  # (Q) a temporal interval
-
-  mdb_MONTH_INTERVAL = "month_interval"
-  mdb_SEC_INTERVAL   = "sec_interval"
-  mdb_WRD            = "wrd"
-  mdb_TINYINT        = "tinyint"
-
-  # Not on the website:
-  mdb_SHORTINT    = "shortint"
-  mdb_MEDIUMINT   = "mediumint"
-  mdb_LONGINT     = "longint"
-  mdb_FLOAT       = "float"
-  mdb_TIMESTAMPTZ = "timestamptz"
-
-  # full names and aliases, spaces are replaced with underscores
-  mdb_CHARACTER               = mdb_CHAR
-  mdb_CHARACTER_VARYING       = mdb_VARCHAR
-  mdb_CHARACHTER_LARGE_OBJECT = mdb_CLOB
-  mdb_BINARY_LARGE_OBJECT     = mdb_BLOB
-  mdb_NUMERIC                 = mdb_DECIMAL
-  mdb_DOUBLE_PRECISION        = mdb_DOUBLE
-
-proc columns(r: var Rows): seq[string] =
-  if r.columns == nil:
-    newSeq(r.columns, len(r.description))
-    for i, d in pairs(r.description):
-      r.columns[i] = d.columnName
-  result = r.columns
-
-proc close(r: var Rows) =
-  r.active = false
-
-proc parseTuple(s: Stmt, d: string): seq[Value] =
-  let L = len(s.description)
-  newSeq(result, L)
-  var i = 0
-  for value in split(d.substr(1, d.len-2), ",\t"):
-    if i > L:
-      dbError("Length of row doesn't match header")
-    result[i] = value
-    inc i
-
-proc updateDescription(s: var Stmt, columnNames, columnTypes: openarray[string],
-                       displaySizes, internalSizes,
-                       precisions, scales, nullOks: openarray[int]) =
-  if s.description.isNil:
-    newSeq(s.description, len(columnNames))
-  else:
-    setLen(s.description, len(columnNames))
-  for i in 0..high(columnNames):
-    s.description[i] = Description(
-      columnName:   columnNames[i],
-      columnType:   columnTypes[i],
-      displaySize:  displaySizes[i],
-      internalSize: internalSizes[i],
-      precision:    precisions[i],
-      scale:        scales[i],
-      nullOk:       nullOks[i])
 
 proc parseValue(r: string; a, b: int): string =
   if r[a] == '"':
@@ -407,125 +289,6 @@ proc parseUpdateResult(r: string; start: int;
       inc i, L
       i += parseBiggestInt(r, lastRowId, i)
   result = i
-
-proc storeResult(s: var Stmt; r: string) =
-  var columnNames: seq[string]
-  var columnTypes: seq[string]
-  var displaySizes: seq[int]
-  var internalSizes: seq[int]
-  var precisions: seq[int]
-  var scales: seq[int]
-  var nullOks: seq[int]
-
-  for line in splitLines(r):
-    if startsWith(line, mapi_MSG_INFO):
-      discard "TODO log"
-    elif startsWith(line, mapi_MSG_QPREPARE):
-      let t = split(strutils.strip(line.substr(2)), " ")
-      s.execId = parseInt(t[0])
-      return
-    elif startsWith(line, mapi_MSG_QTABLE):
-      let t = split(strutils.strip(line.substr(2)), " ")
-      s.queryId = parseInt(t[0])
-      s.rowCount = parseInt(t[1])
-      s.columnCount = parseInt(t[2])
-
-      columnNames = newSeq[string](s.columnCount)
-      columnTypes = newSeq[string](s.columnCount)
-      displaySizes = newSeq[int](s.columnCount)
-      internalSizes = newSeq[int](s.columnCount)
-      precisions = newSeq[int](s.columnCount)
-      scales = newSeq[int](s.columnCount)
-      nullOks = newSeq[int](s.columnCount)
-    elif startsWith(line, mapi_MSG_TUPLE):
-      let v = s.parseTuple(line)
-      s.rows.add v
-    elif startsWith(line, mapi_MSG_QBLOCK):
-      s.rows = newSeq[seq[Value]](0)
-    elif startsWith(line, mapi_MSG_QSCHEMA):
-      s.offset = 0
-      s.rows = newSeq[seq[Value]](0)
-      s.lastRowId = 0
-      s.description = nil
-      s.rowCount = 0
-    elif startsWith(line, mapi_MSG_QUPDATE):
-      let t = split(strutils.strip(line.substr(2)), " ")
-      s.rowCount = parseInt(t[0])
-      s.lastRowId = parseInt(t[1])
-    elif startsWith(line, mapi_MSG_QTRANS):
-      s.offset = 0
-      s.rows = newSeq[seq[Value]](0)
-      s.lastRowId = 0
-      s.description = nil
-      s.rowCount = 0
-    elif startsWith(line, mapi_MSG_HEADER):
-      let t = split(line.substr(1), "#")
-      let data = strutils.strip(t[0])
-      let identity = strutils.strip(t[1])
-
-      var values = newSeq[string]()
-      for value in split(data, ','):
-        values.add strutils.strip(value)
-
-      if identity == "name":
-        columnNames = values
-      elif identity == "type":
-        columnTypes = values
-      elif identity == "typesizes":
-        var sizes = newSeq[seq[int]](len(values))
-        for i, value in pairs(values):
-          var s = newSeq[int](0)
-          for v in split(value, " "):
-            s.add parseInt(v)
-          internalSizes[i] = s[0]
-          sizes.add s
-        for j, t in pairs(columnTypes):
-          if t == "decimal":
-            precisions[j] = sizes[j][0]
-            scales[j] = sizes[j][1]
-      s.updateDescription(columnNames, columnTypes, displaySizes,
-        internalSizes, precisions, scales, nullOks)
-      s.offset = 0
-      s.lastRowId = 0
-    elif line.startsWith mapi_MSG_PROMPT:
-      discard "nothing to do"
-    elif line.startsWith mapi_MSG_ERROR:
-      dbError("Database error: " & line.substr(1))
-    else:
-      dbError("Unknown state: " & r)
-
-const
-  c_ARRAY_SIZE = 100
-
-proc fetchNext(db: DbConn; r: var Rows) =
-  if r.rowNum >= r.rowCount:
-    return
-
-  r.offset += len(r.rows)
-  let xend = min(r.rowCount, r.rowNum+c_ARRAY_SIZE)
-  let amount = xend - r.offset
-
-  let cmd0 = "Xexport $# $# $#" % [$r.queryId, $r.offset, $amount]
-  discard db.cmd(cmd0)
-
-  #r.storeResult(res) XXX
-  #r.rows = r.stmt.rows
-  #r.description = r.stmt.description
-
-proc next(db: DbConn; r: var Rows; dest: var seq[Value]) =
-  if not r.active:
-    dbError("Rows closed")
-  if r.queryId == -1:
-    dbError("Query didn't result in a resultset")
-  if r.rowNum >= r.rowCount:
-    # EOF:
-    return
-  if r.rowNum >= r.offset+len(r.rows):
-    db.fetchNext(r)
-
-  for i, v in mpairs(r.rows[r.rowNum-r.offset]):
-    dest[i] = v
-  r.rowNum += 1
 
 proc dbQuote(s: string; result: var string) =
   if s.isNil:
@@ -702,7 +465,6 @@ proc parseColumnInfo(r: string; columns: var DbColumns) =
     i = lineEnd+1
   #echo r
   #echo tableNames, " ", names, " ", types, " ", typesizes, " ", lens
-  var n = names[0]
   var cols = 0
 
   proc colEnd(r: string; b: var((int, int))): string =
